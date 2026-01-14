@@ -1,124 +1,34 @@
-import sys
-import subprocess
-import threading
-import time
-import os
-import streamlit.components.v1 as components
+import sys import subprocess
+import threading import os import time import streamlit as st from google.oauth2.service_account import Credentials from googleapiclient.discovery import build import requests
 
-# Install streamlit jika belum ada
-try:
-    import streamlit as st
-except ImportError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "streamlit"])
-    import streamlit as st
+================= CONFIG =================
 
+SERVICE_ACCOUNT_FILE = 'service_account.json' SCOPES = ['https://www.googleapis.com/auth/drive.readonly'] DRIVE_FOLDER_ID = 'ISI_FOLDER_ID_KAMU' STREAM_KEY = os.getenv('YT_STREAM_KEY')  # set di Streamlit Cloud Secrets
 
-def run_ffmpeg(video_path, stream_key, is_shorts, log_callback):
-    output_url = f"rtmp://a.rtmp.youtube.com/live2/{stream_key}"
-    scale = "-vf scale=720:1280" if is_shorts else ""
-    cmd = [
-        "ffmpeg", "-re", "-stream_loop", "-1", "-i", video_path,
-        "-c:v", "libx264", "-preset", "veryfast", "-b:v", "2500k",
-        "-maxrate", "2500k", "-bufsize", "5000k",
-        "-g", "60", "-keyint_min", "60",
-        "-c:a", "aac", "-b:a", "128k",
-        "-f", "flv"
-    ]
-    if scale:
-        cmd += scale.split()
-    cmd.append(output_url)
-    log_callback(f"Menjalankan: {' '.join(cmd)}")
-    try:
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        for line in process.stdout:
-            log_callback(line.strip())
-        process.wait()
-    except Exception as e:
-        log_callback(f"Error: {e}")
-    finally:
-        log_callback("Streaming selesai atau dihentikan.")
+================= GOOGLE DRIVE =================
 
-def main():
-    # Page configuration must be the first Streamlit command
-    st.set_page_config(
-        page_title="Streaming YT by didinchy",
-        page_icon="📈",
-        layout="wide"
-    )
-    st.title("Live Streaming Loss Doll")
-    
-    # Bagian iklan baru
-    show_ads = st.checkbox("Tampilkan Iklan", value=True)
-    if show_ads:
-        st.subheader("Iklan Sponsor")
-        components.html(
-            """
-            <div style="background:#f0f2f6;padding:20px;border-radius:10px;text-align:center">
-                <script type='text/javascript' 
-                        src='//pl26562103.profitableratecpm.com/28/f9/95/28f9954a1d5bbf4924abe123c76a68d2.js'>
-                </script>
-                <p style="color:#888">Iklan akan muncul di sini</p>
-            </div>
-            """,
-            height=300
-        )
+@st.cache_resource def get_drive_service(): creds = Credentials.from_service_account_file( SERVICE_ACCOUNT_FILE, scopes=SCOPES ) return build('drive', 'v3', credentials=creds)
 
-    # List available video files
-    video_files = [f for f in os.listdir('.') if f.endswith(('.mp4', '.flv'))]
+def list_drive_videos(): service = get_drive_service() query = f"'{DRIVE_FOLDER_ID}' in parents and mimeType contains 'video/' and trashed=false" res = service.files().list( q=query, fields='files(id,name)', orderBy='name' ).execute() return res.get('files', [])
 
-    st.write("Video yang tersedia:")
-    selected_video = st.selectbox("Pilih video", video_files) if video_files else None
+def download_video(file_id, filename): creds = Credentials.from_service_account_file( SERVICE_ACCOUNT_FILE, scopes=SCOPES ) creds.refresh(requests.Request()) headers = {"Authorization": f"Bearer {creds.token}"} url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
 
-    uploaded_file = st.file_uploader("Atau upload video baru (mp4/flv - codec H264/AAC)", type=['mp4', 'flv'])
+with requests.get(url, headers=headers, stream=True) as r:
+    with open(filename, 'wb') as f:
+        for chunk in r.iter_content(1024 * 1024):
+            if chunk:
+                f.write(chunk)
 
-    if uploaded_file:
-        # Save uploaded file
-        with open(uploaded_file.name, "wb") as f:
-            f.write(uploaded_file.read())
-        st.success("Video berhasil diupload!")
-        video_path = uploaded_file.name
-    elif selected_video:
-        video_path = selected_video
-    else:
-        video_path = None
+================= FFMPEG =================
 
-    stream_key = st.text_input("Stream Key", type="password")
-    date = st.date_input("Tanggal Tayang")
-    time_val = st.time_input("Jam Tayang")
-    is_shorts = st.checkbox("Mode Shorts (720x1280)")
+def stream_video(video_path): rtmp = f"rtmp://a.rtmp.youtube.com/live2/{STREAM_KEY}" cmd = [ 'ffmpeg', '-re', '-i', video_path, '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', '2500k', '-maxrate', '2500k', '-bufsize', '5000k', '-g', '60', '-keyint_min', '60', '-c:a', 'aac', '-b:a', '128k', '-f', 'flv', rtmp ] subprocess.run(cmd)
 
-    log_placeholder = st.empty()
-    logs = []
-    streaming = st.session_state.get('streaming', False)
+================= AUTO LOOP =================
 
-    def log_callback(msg):
-        logs.append(msg)
-        try:
-            log_placeholder.text("\n".join(logs[-20:]))
-        except:
-            print(msg)  # Fallback to console logging
+def auto_stream(): videos = list_drive_videos() for v in videos: temp = 'current.mp4' st.write(f"▶ Streaming: {v['name']}") download_video(v['id'], temp) stream_video(temp) if os.path.exists(temp): os.remove(temp) time.sleep(2)
 
-    if 'ffmpeg_thread' not in st.session_state:
-        st.session_state['ffmpeg_thread'] = None
+================= UI =================
 
-    if st.button("Jalankan Streaming"):
-        if not video_path or not stream_key:
-            st.error("Video dan stream key harus diisi!")
-        else:
-            st.session_state['streaming'] = True
-            st.session_state['ffmpeg_thread'] = threading.Thread(
-                target=run_ffmpeg, args=(video_path, stream_key, is_shorts, log_callback), daemon=True)
-            st.session_state['ffmpeg_thread'].start()
-            st.success("Streaming dimulai!")
+st.set_page_config(page_title='FULL AUTO YT LIVE', layout='wide') st.title('🔴 FULL OTOMATIS YouTube Live') st.write('Tanpa klik. Playlist otomatis dari Google Drive.')
 
-    if st.button("Stop Streaming"):
-        st.session_state['streaming'] = False
-        os.system("pkill ffmpeg")
-        if os.path.exists("temp_video.mp4"):
-            os.remove("temp_video.mp4")
-        st.warning("Streaming dihentikan!")
-
-    log_placeholder.text("\n".join(logs[-20:]))
-
-if __name__ == '__main__':
-    main()
+if not STREAM_KEY: st.error('STREAM KEY belum di-set di Secrets!') else: st.success('Streaming berjalan otomatis...') auto_stream()
